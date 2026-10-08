@@ -17,9 +17,8 @@ ANYMODEL_CHAT_URL = "https://anymodel.org/v1/chat/completions"
 TAVILY_API_KEY = "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"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
-# --- Обязательная подписка на канал ---
-SUBSCRIBE_CHANNEL_ID = -100402148161
-SUBSCRIBE_CHANNEL_USERNAME = "@Neural_Mid"
+# --- Канал поддержки (просто упоминание в текстах, БЕЗ проверки подписки) ---
+SUPPORT_CHANNEL_USERNAME = "@Neural_Mid"
 
 # --- Администратор ---
 ADMIN_ID = 8838756007
@@ -28,7 +27,6 @@ ADMIN_ID = 8838756007
 START_BALANCE = 100           # стартовый баланс монет (при первом /start)
 DAILY_BONUS_MIN = 20          # минимальный ежедневный бонус
 DAILY_BONUS_MAX = 30          # максимальный ежедневный бонус
-SUBSCRIBE_BONUS = 100         # бонус за подписку на канал (однократно)
 COST_PER_REQUEST = 1          # 1 монета = 1 запрос
 
 # --- Автоматическое ежедневное начисление ---

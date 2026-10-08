@@ -8,29 +8,34 @@ HentixAI — Telegram-бот на aiogram 3.x.
 2. Bot Settings -> Allowed to be added to groups = Allow Groups = ВКЛ.
 3. Bot Settings -> Inline Mode = ВКЛ —
    иначе не будет работать режим "@HentixAI_bot вопрос".
-4. Бот должен быть АДМИНИСТРАТОРОМ канала @Neural_Mid (иначе проверка
-   подписки не сможет получить статусы участников).
+4. Проверка подписки на канал НЕ требуется — бот работает для всех
+   (проверки подписки полностью удалены из кода).
 
-Функционал:
-- ПРАВИЛО 1: обязательная проверка подписки на канал @Neural_Mid
-  (get_chat_member, member/admin/creator -> True; left/kicked -> False;
-  кнопки "📢 Подписаться" / "✅ Я подписался" (callback check_sub),
-  однократный бонус +100 за первую подтверждённую подписку).
-- ПРАВИЛО 2: INLINE MODE без кнопок. Пользователь пишет "@HentixAI_bot вопрос",
-  получает InlineQueryResultArticle ("Ваш запрос"), при нажатии текст уходит
-  в чат как обычное сообщение пользователя и ловится универсальным
-  @router.message(F.text): "⌨️ Хентикс думает..." -> process_query ->
-  evaluate_response -> редактирование статусного сообщения через
-  bot.edit_message_text(chat_id=..., message_id=...) (НЕ callback.message!).
-- ПРАВИЛО 3: упоминания в группах по триггерам @hentixai_bot, @hentixai,
-  @hentix, "хентикс", "hentix" (регистронезависимо).
-- ПРАВИЛО 4: экономика (старт 100 монет), автоначисление 20-30 монет всем
-  в 00:00 МСК с уведомлением "🎁 Ежедневное начисление! ..." (try/except).
-- ПРАВИЛО 5: /start, /menu (в ЛС кнопки, в группах статистика), /balance,
-  callback show_balance, /clear_memory, /members.
-- ПРАВИЛО 6: память chat_history (100 сообщений, 50 в контекст), Tavily-поиск.
-- ПРАВИЛО 7: приветствие при добавлении бота в группу (my_chat_member).
-- ПРАВИЛО 8: Windows-фикс asyncio, логирование, try/except вокруг всех API,
+Функционал (обновлённая версия):
+- ЗАДАЧА 1: проверка подписки УБРАНА ПОЛНОСТЬЮ — нет check_subscription(),
+  нет get_chat_member() для канала, нет is_subscribed, нет кнопок
+  "Подписаться"/"Я подписался", нет callback "check_sub". Бот работает для
+  всех пользователей без каких-либо проверок подписки.
+- ЗАДАЧА 2: INLINE MODE с кнопкой. Пользователь пишет "@HentixAI_bot вопрос"
+  -> InlineQueryResultArticle(id="1", title="Ваш запрос",
+  description=query[:50], input_message_content=query, reply_markup — кнопка
+  "⚡ Получить ответ" с callback_data="inline:<query>"). При нажатии на кнопку
+  (callback_inline_answer): callback.answer() -> баланс <= 0 -> edit_text
+  "💸 Монеты закончились! Ждите начисления в 00:00 МСК."; баланс > 0 ->
+  НОВОЕ сообщение "⌨️ Хентикс думает..." (reply) -> process_query ->
+  evaluate_response -> списание 1 монеты -> bot.edit_message_text
+  (chat_id=..., message_id=...) этого статусного сообщения. chat_id:
+  callback.message.chat.id, если message есть, иначе callback.inline_message_id.
+- Группы: упоминания по триггерам @hentixai_bot, @hentixai, @hentix,
+  "хентикс", "hentix" (регистронезависимо) — та же логика "думает -> ответ".
+- Экономика: старт 100 монет, 1 монета = 1 запрос, автоначисление 20-30
+  монет всем в 00:00 МСК с уведомлением "🎁 Ежедневное начисление! ..."
+  (try/except на случай блокировки бота пользователем).
+- Команды: /start, /menu (в ЛС кнопки, в группах статистика), /balance,
+  /daily, /help, /debug, callback show_balance, /clear_memory, /members.
+- Память chat_history (100 сообщений, 50 в контекст), поиск Tavily.
+- Приветствие при добавлении бота в группу (my_chat_member).
+- Windows-фикс asyncio, логирование, try/except вокруг всех API,
   html.escape имён, инициализация БД через aiosqlite.
 """
 
@@ -101,8 +106,6 @@ async def init_db() -> None:
                 username TEXT,
                 balance INTEGER DEFAULT 100,
                 last_daily_bonus TEXT,
-                is_subscribed INTEGER DEFAULT 0,
-                subscribe_bonus_given INTEGER DEFAULT 0,
                 created_at TEXT
             )
             """
@@ -123,7 +126,6 @@ async def init_db() -> None:
         # Мягкие миграции для старых БД
         for ddl in (
             "ALTER TABLE users ADD COLUMN created_at TEXT",
-            "ALTER TABLE users ADD COLUMN subscribe_bonus_given INTEGER DEFAULT 0",
         ):
             with contextlib.suppress(Exception):
                 await db.execute(ddl)
@@ -146,8 +148,8 @@ async def ensure_user(user_id: int, username: str | None) -> int:
         now = datetime.now().isoformat(timespec="seconds")
         async with aiosqlite.connect(config.DB_PATH) as db:
             await db.execute(
-                "INSERT INTO users (user_id, username, balance, is_subscribed, "
-                "subscribe_bonus_given, created_at) VALUES (?, ?, ?, 0, 0, ?)",
+                "INSERT INTO users (user_id, username, balance, created_at) "
+                "VALUES (?, ?, ?, ?)",
                 (user_id, username or "", config.START_BALANCE, now),
             )
             await db.commit()
@@ -350,71 +352,6 @@ async def auto_daily_loop() -> None:
         await asyncio.sleep(24 * 3600)
 
 
-# ================= ПРОВЕРКА ПОДПИСКИ (ПРАВИЛО 1) =================
-
-async def check_subscription(user_id: int) -> bool:
-    """
-    Проверка подписки на канал через bot.get_chat_member.
-
-    - status member/administrator/creator -> True;
-    - status left/kicked -> False;
-    - прочие ошибки API -> False (с логированием);
-    - достоверный результат кэшируется в поле is_subscribed таблицы users.
-    """
-    try:
-        member = await bot.get_chat_member(config.SUBSCRIBE_CHANNEL_ID, user_id)
-    except Exception as e:
-        logger.error("Ошибка get_chat_member для %s: %s", user_id, e)
-        return False
-
-    subscribed = member.status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR,
-    )
-    try:
-        async with aiosqlite.connect(config.DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET is_subscribed = ? WHERE user_id = ?",
-                (1 if subscribed else 0, user_id),
-            )
-            await db.commit()
-    except Exception as e:
-        logger.error("Ошибка обновления is_subscribed для %s: %s", user_id, e)
-    if not subscribed:
-        logger.info("Пользователь %s НЕ подписан на канал (status=%s)", user_id, member.status)
-    return subscribed
-
-
-def subscribe_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки блокировки: '📢 Подписаться' (url) + '✅ Я подписался' (check_sub)."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="📢 Подписаться",
-            url=f"https://t.me/{config.SUBSCRIBE_CHANNEL_USERNAME.lstrip('@')}",
-        )],
-        [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
-    ])
-
-
-async def require_subscription(message: Message) -> bool:
-    """
-    ПРАВИЛО 1: обязательная проверка подписки — ПЕРВЫЙ шаг в любом хендлере.
-    Если check_subscription вернула False — немедленно отправляем
-    предупреждение с кнопками и возвращаем False (обработчик прекращает работу).
-    """
-    user_id = message.from_user.id
-    await ensure_user(user_id, message.from_user.username)
-    if await check_subscription(user_id):
-        return True  # подписан — проходит дальше молча
-    await message.answer(
-        f"⚠️ Для использования бота нужно подписаться на канал "
-        f"{config.SUBSCRIBE_CHANNEL_USERNAME}",
-        reply_markup=subscribe_keyboard(),
-    )
-    return False
-
-
 # ================= КЛАВИАТУРЫ И ТЕКСТЫ =================
 
 def start_keyboard() -> InlineKeyboardMarkup:
@@ -428,7 +365,7 @@ def start_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💰 Баланс", callback_data="show_balance"),
             InlineKeyboardButton(
                 text="📢 Канал",
-                url=f"https://t.me/{config.SUBSCRIBE_CHANNEL_USERNAME.lstrip('@')}",
+                url=f"https://t.me/{config.SUPPORT_CHANNEL_USERNAME.lstrip('@')}",
             ),
         ],
     ])
@@ -600,7 +537,7 @@ async def on_bot_added(event: Message):
                 "Чтобы поговорить со мной, просто обратитесь ко мне по этим триггерам:\n"
                 "@Hentix, @HentixAI, Hentix, Хентикс\n\n"
                 "Если нашли ошибку, то пожалуйста сообщите в боте поддержки: "
-                f"{config.SUBSCRIBE_CHANNEL_USERNAME}"
+                f"{config.SUPPORT_CHANNEL_USERNAME}"
             )
     except Exception as e:
         logger.error("Ошибка приветствия группы: %s", e)
@@ -610,10 +547,9 @@ async def on_bot_added(event: Message):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    """/start: проверка подписки (ПЕРВЫМ шагом), создание юзера с балансом 100, приветствие."""
+    """/start: создание юзера с балансом 100 (если новый), приветствие.
+    Проверка подписки НЕ выполняется (удалена полностью)."""
     if message.from_user is None:
-        return
-    if not await require_subscription(message):
         return
 
     user_id = message.from_user.id
@@ -639,6 +575,7 @@ async def cmd_menu(message: Message):
     """
     if message.from_user is None:
         return
+    await ensure_user(message.from_user.id, message.from_user.username)
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         # --- Статистика группы ---
         try:
@@ -668,9 +605,7 @@ async def cmd_menu(message: Message):
         await bot.send_message(chat_id=message.chat.id, text="\n".join(lines))
         return
 
-    # --- ЛС: проверка подписки первым шагом, затем меню с кнопками ---
-    if not await require_subscription(message):
-        return
+    # --- ЛС: меню с кнопками (без проверок подписки) ---
     await message.answer("🎛 <b>Меню HentixAI</b>\n\nВыберите действие:",
                          reply_markup=start_keyboard())
 
@@ -680,17 +615,19 @@ async def cmd_help(message: Message):
     """/help: справка."""
     if message.from_user is None:
         return
-    if not await require_subscription(message):
-        return
+    await ensure_user(message.from_user.id, message.from_user.username)
     await message.answer(
         "ℹ️ <b>Справка HentixAI</b>\n\n"
         "Напишите мне любой вопрос — я отвечу через AI.\n"
         "Если вопрос требует актуальных данных (курс, новости, погода...) — "
         "я автоматически поищу в интернете.\n"
-        "Inline-режим: напишите <code>@HentixAI_bot вопрос</code> в любом чате.\n\n"
+        "Inline-режим: напишите <code>@HentixAI_bot вопрос</code> в любом чате\n"
+        "и нажмите кнопку ⚡️ Получить ответ.\n\n"
         "/start — приветствие и начало работы\n"
         "/menu — главное меню с кнопками\n"
         "/balance — проверить баланс монет\n"
+        "/daily — вручную получить дневной бонус (раз в сутки)\n"
+        "/debug — диагностика бота\n"
         "/clear_memory — очистить память чата\n"
         "/members — список участников группы (только в группах)\n\n"
         "<b>В группах:</b> упомяните <code>@HentixAI</code> или напишите «хентикс …»."
@@ -713,8 +650,7 @@ async def cmd_balance(message: Message):
     """/balance: баланс и время до начисления через обычное сообщение."""
     if message.from_user is None:
         return
-    if not await require_subscription(message):
-        return
+    await ensure_user(message.from_user.id, message.from_user.username)
     row = await get_user(message.from_user.id)
     balance = row["balance"] if row else config.START_BALANCE
     await message.answer(balance_text(balance))
@@ -724,8 +660,6 @@ async def cmd_balance(message: Message):
 async def cmd_clear(message: Message):
     """/clear_memory: очищает chat_history текущего чата."""
     if message.from_user is None:
-        return
-    if not await require_subscription(message):
         return
     deleted = await clear_history(message.chat.id)
     await message.answer(f"🧹 Память очищена. Удалено записей: {deleted}.")
@@ -738,8 +672,6 @@ async def cmd_members(message: Message):
         return
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.answer("⚠️ Команда /members работает только в группах.")
-        return
-    if not await require_subscription(message):
         return
     try:
         count = await bot.get_chat_members_count(message.chat.id)
@@ -760,6 +692,99 @@ async def cmd_members(message: Message):
     except Exception as e:
         logger.error("Ошибка /members: %s", e)
         await message.answer("❌ Не удалось получить данные участников.")
+
+
+async def give_manual_daily(user_id: int) -> tuple[int, int]:
+    """
+    /daily: ручное начисление дневного бонуса (20-30 монет), но не чаще
+    одного раза в сутки (сравниваем last_daily_bonus по дате МСК).
+    Возвращает (bonus, new_balance); bonus == 0 — бонус уже получен сегодня.
+    """
+    today_msk = msk_now().date().isoformat()
+    row = await get_user(user_id)
+    if row is None:
+        return 0, 0
+    last = (row["last_daily_bonus"] or "")[:10]
+    if last == today_msk:
+        return 0, row["balance"]
+    bonus = random.randint(config.DAILY_BONUS_MIN, config.DAILY_BONUS_MAX)
+    now = msk_now().isoformat(timespec="seconds")
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET balance = balance + ?, last_daily_bonus = ? "
+            "WHERE user_id = ?",
+            (bonus, now, user_id),
+        )
+        cur = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        new_balance = (await cur.fetchone())[0]
+        await db.commit()
+    logger.info("/daily: начислено %s монет пользователю %s", bonus, user_id)
+    return bonus, new_balance
+
+
+@router.message(Command("daily"))
+async def cmd_daily(message: Message):
+    """/daily: вручную получить дневной бонус (не чаще раза в сутки)."""
+    if message.from_user is None:
+        return
+    user_id = message.from_user.id
+    await ensure_user(user_id, message.from_user.username)
+    try:
+        bonus, balance = await give_manual_daily(user_id)
+        if bonus == 0:
+            await message.answer(
+                "🎁 Дневной бонус уже получен сегодня." + "\n\n" + balance_text(balance)
+            )
+        else:
+            await message.answer(
+                "🎁 Ежедневное начисление!" + "\n\n" +
+                f"Вам начислено {bonus} монет." + "\n"+
+                f"Текущий баланс: {balance} монет." + "\n\n" +
+                "Следующее начисление завтра в 00:00 МСК."
+            )
+    except Exception as e:
+        logger.error("Ошибка /daily: %s", e)
+        with contextlib.suppress(Exception):
+            await message.answer("❌ Не удалось начислить бонус. Попробуйте позже.")
+
+
+@router.message(Command("debug"))
+async def cmd_debug(message: Message):
+    """/debug: диагностика — версии, состояние БД, ключевые настройки."""
+    if message.from_user is None:
+        return
+    try:
+        import aiogram
+        async with aiosqlite.connect(config.DB_PATH) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM users")
+            n_users = (await cur.fetchone())[0]
+            cur = await db.execute("SELECT COUNT(*) FROM chat_history")
+            n_msgs = (await cur.fetchone())[0]
+            cur = await db.execute(
+                "SELECT balance FROM users WHERE user_id = ?", (message.from_user.id,)
+            )
+            r = await cur.fetchone()
+        my_balance = r[0] if r else "нет записи"
+        text = (
+            "🛠 <b>Диагностика HentixAI</b>" + "\n\n" +
+            f"aiogram: <code>{aiogram.__version__}</code>" + "\n"+
+            f"Python: <code>{sys.version.split()[0]}</code>" + "\n"+
+            f"Platform: <code>{sys.platform}</code>" + "\n"+
+            f"Пользователей в БД: {n_users}" + "\n"+
+            f"Сообщений в памяти: {n_msgs}" + "\n"+
+            f"Мой баланс: {my_balance}" + "\n"+
+            f"Чат: <code>{message.chat.id}</code> (type={message.chat.type})" + "\n"+
+            "Проверка подписки: <b>полностью отключена</b>" + "\n"+
+            f"Авто-бонус в 00:00 МСК: {config.AUTO_DAILY_ENABLED}" + "\n"+
+            "Inline: карточка id=1 с кнопкой '⚡ Получить ответ' "
+            "(callback inline:...)" + "\n"+
+            f"Время МСК сейчас: {msk_now().strftime('%H:%M:%S')}"
+        )
+        await message.answer(text)
+    except Exception as e:
+        logger.error("Ошибка /debug: %s", e)
+        with contextlib.suppress(Exception):
+            await message.answer(f"❌ Ошибка диагностики: {e}")
 
 
 # ================= CALLBACK-ХЕНДЛЕРЫ =================
@@ -784,69 +809,17 @@ async def callback_show_balance(callback: CallbackQuery):
             await bot.send_message(chat_id=user_id, text=text)
 
 
-@router.callback_query(F.data == "check_sub")
-async def callback_check_sub(callback: CallbackQuery):
-    """
-    Кнопка '✅ Я подписался' (ПРАВИЛО 1): повторный get_chat_member.
-    True  -> is_subscribed=True в БД, +100 монет (если первый раз),
-             ответ "✅ Спасибо за подписку! Доступ открыт.".
-    False -> "⚠️ Вы ещё не подписались".
-    """
-    user_id = callback.from_user.id
-    await ensure_user(user_id, callback.from_user.username)
-
-    row_before = await get_user(user_id)
-    already_bonus = bool(row_before and row_before["subscribe_bonus_given"])
-
-    subscribed = await check_subscription(user_id)
-    if subscribed:
-        final_text = "✅ Спасибо за подписку! Доступ открыт."
-        if not already_bonus:
-            # Первый раз — начисляем бонус ровно один раз
-            new_balance = await add_balance(user_id, config.SUBSCRIBE_BONUS)
-            try:
-                async with aiosqlite.connect(config.DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE users SET subscribe_bonus_given = 1 WHERE user_id = ?",
-                        (user_id,),
-                    )
-                    await db.commit()
-            except Exception as e:
-                logger.error("Ошибка обновления subscribe_bonus_given: %s", e)
-            final_text += (
-                f"\n\n💰 Вам начислено +{config.SUBSCRIBE_BONUS} монет. "
-                f"Текущий баланс: {new_balance} монет."
-            )
-        # Редактируем сообщение-блокировку, если оно доступно
-        if callback.message is not None:
-            try:
-                await bot.edit_message_text(
-                    chat_id=callback.message.chat.id,
-                    message_id=callback.message.message_id,
-                    text=final_text,
-                )
-            except Exception as e:
-                logger.warning("Не удалось отредактировать сообщение: %s", e)
-                with contextlib.suppress(Exception):
-                    await bot.send_message(chat_id=user_id, text=final_text)
-        else:
-            with contextlib.suppress(Exception):
-                await bot.send_message(chat_id=user_id, text=final_text)
-        await callback.answer("Доступ открыт ✅")
-    else:
-        await callback.answer("⚠️ Вы ещё не подписались", show_alert=True)
-
-
-# ================= INLINE MODE (ПРАВИЛО 2) =================
+# ================= INLINE MODE (ЗАДАЧА 2) =================
 
 @router.inline_query()
 async def on_inline_query(inline_query):
     """
-    Пользователь пишет '@HentixAI_bot текст' в любом чате.
-    Возвращаем одну карточку БЕЗ кнопок: title "Ваш запрос",
-    description — первые 50 символов, input_message_content — сам запрос.
-    При нажатии текст уходит в чат как обычное сообщение пользователя
-    и попадает в универсальный handle_text.
+    ЗАДАЧА 2: пользователь пишет '@HentixAI_bot [вопрос]' в любом чате.
+    Возвращаем ОДНУ карточку InlineQueryResultArticle:
+      id="1", title="Ваш запрос", description=query[:50],
+      input_message_content=InputTextMessageContent(message_text=query),
+      reply_markup — кнопка "⚡ Получить ответ" (callback_data="inline:<query>").
+    Нажатие на кнопку обрабатывает callback_inline_answer().
     """
     query = (inline_query.query or "").strip()
     if not query:
@@ -861,13 +834,21 @@ async def on_inline_query(inline_query):
             )
         ]
     else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="⚡ Получить ответ",
+                # Telegram ограничивает callback_data 64 байтами
+                callback_data=("inline:" + query).encode("utf-8")[:64]
+                .decode("utf-8", "ignore"),
+            )],
+        ])
         results = [
             InlineQueryResultArticle(
-                id="query_1",
+                id="1",
                 title="Ваш запрос",
                 description=query[:50],
                 input_message_content=InputTextMessageContent(message_text=query),
-                # reply_markup НЕ передаём — без кнопок в inline-окне
+                reply_markup=kb,
             )
         ]
     try:
@@ -876,7 +857,124 @@ async def on_inline_query(inline_query):
         logger.error("Ошибка inline-ответа: %s", e)
 
 
-# ================= ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР (ПРАВИЛА 1-3) =================
+# ============ CALLBACK "inline:<query>" (ЗАДАЧА 2) ============
+
+@router.callback_query(F.data.startswith("inline:"))
+async def callback_inline_answer(callback: CallbackQuery):
+    """
+    Нажатие на кнопку "⚡ Получить ответ" в inline-сообщении (ЗАДАЧА 2).
+
+    Шаги строго по ТЗ:
+      1. callback.answer() — убрать "часики" на кнопке.
+      2. Извлечь query из callback.data (после "inline:"); если запрос был
+         длиннее 64 байтов и обрезался — fallback: берём текст сообщения.
+      3. Проверить баланс: <= 0 -> edit_text("Монеты закончились! ...").
+      4. Баланс > 0:
+         a) ОТПРАВИТЬ НОВОЕ СООБЩЕНИЕ "⌨️ Хентикс думает..." (reply);
+         b) сохранить message_id этого сообщения;
+         c) process_query(query, user_id, chat_id);
+         d) evaluate_response(answer);
+         e) True  -> списать 1 монету, РЕДАКТИРОВАТЬ статусное сообщение;
+         f) False -> РЕДАКТИРОВАТЬ на answer + "🔍 Монета не списана".
+      5. Всё обёрнуто в try/except с логированием.
+
+    ВАЖНО: chat_id используется напрямую только при наличии callback.message;
+    иначе — callback.inline_message_id. Редактирование всегда через
+    bot.edit_message_text(chat_id=..., message_id=...).
+    """
+    await callback.answer()  # обязательно — убираем "часики"
+
+    user_id = callback.from_user.id
+    username = callback.from_user.username
+    await ensure_user(user_id, username)
+
+    # ---- chat_id: message.chat.id если message доступен, иначе inline_message_id ----
+    if callback.message is not None and callback.message.chat is not None:
+        chat_id = callback.message.chat.id
+    else:
+        chat_id = callback.inline_message_id  # для inline-результатов message=None
+    msg_id = callback.message.message_id if callback.message is not None else None
+
+    # ---- извлекаем query из callback_data ----
+    raw = callback.data or ""
+    query = raw[len("inline:"):] if raw.startswith("inline:") else ""
+    # fallback: callback_data ограничена 64 байтами — длинный запрос мог
+    # обрезаться; тогда берём текст inline-сообщения целиком.
+    if (not query or len(query.strip()) < 3) and callback.message is not None:
+        mt = (callback.message.text or "").strip()
+        if mt:
+            query = extract_query(mt) or mt
+
+    if not query or len(query.strip()) < 3:
+        logger.warning("inline-callback: пустой query от пользователя %s", user_id)
+        return
+    query = query.strip()
+
+    logger.info("Inline-запрос от %s: %s", user_id, query[:80])
+
+    try:
+        # ---- проверка баланса ----
+        row = await get_user(user_id)
+        balance = row["balance"] if row else config.START_BALANCE
+        if balance <= 0:
+            dead_text = "💸 Монеты закончились! Ждите начисления в 00:00 МСК."
+            if chat_id is not None and msg_id is not None:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id, text=dead_text
+                )
+            else:
+                await bot.send_message(chat_id=user_id, text=dead_text)
+            return
+
+        # ---- a) отправляем НОВОЕ сообщение "Хентикс думает..." (reply) ----
+        with contextlib.suppress(Exception):
+            await bot.send_chat_action(
+                chat_id if chat_id is not None else user_id, "typing"
+            )
+        status_msg = await bot.send_message(
+            chat_id=callback.from_user.id,
+            text="⌨️ Хентикс думает...",
+            reply_to_message_id=msg_id,
+        )
+        # ---- b) сохраняем message_id статусного сообщения ----
+        status_chat_id = status_msg.chat.id
+        status_msg_id = status_msg.message_id
+        asyncio.create_task(_keep_typing(status_chat_id))
+
+        # ---- c) обработка запроса ----
+        answer = await process_query(query, user_id, status_chat_id)
+
+        # ---- d/e/f) оценка ответа, списание монеты, финальный текст ----
+        if evaluate_response(answer):
+            await add_balance(user_id, -config.COST_PER_REQUEST)  # e) -1 монета
+            final = answer[:4000]
+        else:
+            if not answer:
+                answer = "😔 Сервис временно недоступен, попробуйте ещё раз."
+            # f) монета НЕ списана
+            final = (answer + "\n\n" + "🔍 Монета не списана")[:4000]
+
+        # ---- память диалога ----
+        try:
+            await save_message(status_chat_id, user_id, username, "user", query)
+            await save_message(status_chat_id, user_id, username, "assistant", answer)
+        except Exception as e:
+            logger.error("Ошибка сохранения inline-памяти: %s", e)
+
+        # ---- редактируем СВОЁ статусное сообщение на готовый ответ ----
+        await bot.edit_message_text(
+            chat_id=status_chat_id, message_id=status_msg_id, text=final
+        )
+    except Exception as e:
+        logger.exception("Ошибка обработки inline-callback: %s", e)
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                chat_id=callback.from_user.id,
+                text="❌ Произошла ошибка при обработке запроса. Попробуйте ещё раз.",
+            )
+
+
+# ================= ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР (ЗАДАЧА 3: группы и ЛС, БЕЗ проверки подписки) =================
 
 @router.message(F.text)
 async def handle_text(message: Message):
@@ -884,8 +982,9 @@ async def handle_text(message: Message):
     Универсальный хендлер текстовых сообщений: ЛС / группы / супергруппы /
     сообщения, отправленные через Inline Mode.
 
+    Проверка подписки НЕ выполняется (полностью удалена).
     Шаги:
-    1. Проверка подписки (ПРАВИЛО 1) — ПЕРВЫМ шагом.
+    1. Регистрация пользователя (новый -> баланс START_BALANCE=100).
     2. Извлечение запроса: в ЛС — весь текст; в группах — только если найден
        триггер (@HentixAI_bot, @HentixAI, @Hentix, хентикс, hentix).
     3. Проверка баланса (0 -> "Монеты закончились").
@@ -909,9 +1008,8 @@ async def handle_text(message: Message):
         for k in [k for k, v in _MSG_DEDUP.items() if now_ts - v > 60.0]:
             _MSG_DEDUP.pop(k, None)
 
-    # ---- ШАГ 1: ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА ПОДПИСКИ (ПРАВИЛО 1) ----
-    if not await require_subscription(message):
-        return
+    # ---- ШАГ 1: регистрация пользователя (без проверок подписки) ----
+    await ensure_user(user.id, user.username)
 
     in_private = message.chat.type == ChatType.PRIVATE
     query = extract_query(message.text)
@@ -944,8 +1042,7 @@ async def handle_text(message: Message):
         return
 
     # ---- ШАГ 3: typing + статусное сообщение "Хентикс думает..." ----
-    # ВАЖНО: chat_id берём из message.chat.id, НЕ из callback.message
-    # (для inline-сообщений он может быть None).
+    # ВАЖНО: chat_id берём из message.chat.id.
     with contextlib.suppress(Exception):
         await message.answer_chat_action("typing")
     try:
